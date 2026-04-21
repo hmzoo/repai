@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import time
+import shutil
 import yaml
 from datetime import datetime
 from pathlib import Path
@@ -107,8 +108,46 @@ class EvolutionaryAgent:
         self.iteration = 1
         self.max_iterations = self.config.get("execution", {}).get("max_iterations", 10)
         self.timeout_per_iteration = self.config.get("execution", {}).get("timeout_per_iteration", 300)
+        self.debug_mode = self.config.get("execution", {}).get("debug_mode", False)
+        self.logging_config = self.config.get("logging", {})
+        self.iteration_log_path = self.logging_config.get("iteration_log", "iteration_log.md")
         self.file_mgr = FileManager()
         self.start_time = datetime.now()
+        self._prepare_iteration_log()
+
+    def _prepare_iteration_log(self):
+        """Prepare the iteration log file at startup based on logging settings."""
+        reset_on_start = self.logging_config.get("reset_on_start", True)
+        archive_iterations = self.logging_config.get("archive_iterations", True)
+        log_path = Path(self.iteration_log_path)
+
+        if not log_path.exists():
+            self.file_mgr.write_markdown(self.iteration_log_path, self._build_log_header())
+            return
+
+        if not reset_on_start:
+            return
+
+        current_content = self.file_mgr.read_markdown(self.iteration_log_path)
+        if archive_iterations and current_content.strip():
+            archive_dir = Path("logs") / "archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_file = archive_dir / f"iteration_log_{timestamp}.md"
+            shutil.copyfile(log_path, archive_file)
+            print(f"🗂️  Previous log archived to {archive_file}")
+
+        self.file_mgr.write_markdown(self.iteration_log_path, self._build_log_header())
+
+    @staticmethod
+    def _build_log_header() -> str:
+        """Standard header written when starting a fresh iteration log."""
+        return (
+            "# Iteration Log\n\n"
+            "## Historique d'exécution\n\n"
+            "Chaque itération est documentée ci-dessous.\n\n"
+            "---\n"
+        )
 
     def get_llm_client(self):
         """Create an LLM client if the provider and API key are configured."""
@@ -293,6 +332,12 @@ class EvolutionaryAgent:
 
         if iteration_data["llm_summary"]:
             print("🧠 LLM summary generated for this iteration")
+            preview = iteration_data["llm_summary"].replace("\n", " ").strip()
+            print(f"   Preview: {preview[:180]}{'...' if len(preview) > 180 else ''}")
+            if self.debug_mode:
+                print("   Full summary:")
+                for line in iteration_data["llm_summary"].splitlines():
+                    print(f"     {line}")
         elif iteration_data["mode"] == "llm_error":
             print(f"⚠️  LLM call failed: {iteration_data['llm_error']}")
         else:
@@ -329,7 +374,7 @@ class EvolutionaryAgent:
 
 ---
 """
-        self.file_mgr.append_markdown("iteration_log.md", log_entry)
+        self.file_mgr.append_markdown(self.iteration_log_path, log_entry)
         print(f"✅ Iteration {self.iteration} logged")
     
     def run(self):

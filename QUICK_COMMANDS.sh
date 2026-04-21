@@ -32,7 +32,7 @@ python3 validate.py
 bash reset.sh
 
 # 5. Reset project to a specific git ref
-bash reset.sh v1.0-base-gemini
+bash reset.sh v1.0-base-gemini-logging
 
 # ============================================================================
 # MONITORING & INSPECTION

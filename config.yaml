@@ -38,6 +38,7 @@ apis:
 logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR
   iteration_log: "iteration_log.md"
+  reset_on_start: true
   archive_iterations: true
 
 # Safety Settings

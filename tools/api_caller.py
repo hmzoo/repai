@@ -199,11 +199,15 @@ class GoogleGeminiClient(APIClient):
             role = "user" if msg["role"] != "assistant" else "model"
             contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
+        thinking_budget = kwargs.pop("thinking_budget", 0)
         data = {
             "contents": contents,
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_tokens,
+                "thinkingConfig": {
+                    "thinkingBudget": thinking_budget,
+                },
             }
         }
 
@@ -214,7 +218,11 @@ class GoogleGeminiClient(APIClient):
         # Normalize response to same shape as OpenAIClient
         if raw["success"]:
             try:
-                text = raw["data"]["candidates"][0]["content"]["parts"][0]["text"]
+                parts = raw["data"]["candidates"][0]["content"].get("parts", [])
+                text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
+                text = "".join(text_parts).strip()
+                if not text:
+                    raise KeyError("No text content in Gemini response parts")
                 raw["data"] = {"choices": [{"message": {"content": text}}]}
             except (KeyError, IndexError):
                 raw["success"] = False
