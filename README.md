@@ -73,6 +73,13 @@ python main.py
 
 L'agent s'exécutera récursivement jusqu'à `max_iterations` (configurable).
 
+### 3bis. Revenir à l'état initial
+```bash
+bash reset.sh
+```
+
+Par défaut, le script restaure le dépôt sur le tag `v1.0-base`, supprime les fichiers non suivis et conserve les fichiers ignorés comme `.env`.
+
 ### 4. Suivre l'Évolution
 - **Résultats détaillés** → `iteration_log.md`
 - **Prompt actuel** → `system_prompt.md`

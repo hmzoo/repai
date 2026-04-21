@@ -28,6 +28,12 @@ python3 main.py
 # 3. Validate project integrity
 python3 validate.py
 
+# 4. Reset project to initial tagged state
+bash reset.sh
+
+# 5. Reset project to a specific git ref
+bash reset.sh v1.0-base
+
 # ============================================================================
 # MONITORING & INSPECTION
 # ============================================================================
@@ -109,6 +115,9 @@ git commit -m "Iteration N complete"
 
 # 4. View history
 git log --oneline
+
+# 5. Return to initial project state
+bash reset.sh
 
 # ============================================================================
 # USEFUL FUNCTIONS (Add to .bashrc)
