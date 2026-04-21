@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET_REF="${1:-v1.0-base-reset}"
+TARGET_REF="${1:-v1.0-base-gemini}"
 
 cd "$ROOT_DIR"
 

@@ -30,6 +30,7 @@ def main():
     # 1. Load configuration
     print("📖 Loading configuration...")
     config = Config()
+    config.data.setdefault("execution", {})["max_iterations"] = 3
     print(f"   Provider: {config.get('llm', {}).get('provider')}")
     print(f"   Model: {config.get('llm', {}).get('model')}")
     print(f"   Max iterations: {config.get('execution', {}).get('max_iterations')}")
@@ -40,6 +41,7 @@ def main():
     
     # 3. Run the loop
     print("\n▶️  Starting recursive execution loop...")
+    print("   Example mode runs 3 iterations and shows built-in checks.")
     agent.run()
     
     print("\n✨ Agent execution complete!")

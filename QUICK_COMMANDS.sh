@@ -32,7 +32,7 @@ python3 validate.py
 bash reset.sh
 
 # 5. Reset project to a specific git ref
-bash reset.sh v1.0-base
+bash reset.sh v1.0-base-gemini
 
 # ============================================================================
 # MONITORING & INSPECTION
@@ -153,11 +153,11 @@ bash reset.sh
 # ENVIRONMENT SETUP
 # ============================================================================
 
-# Set OpenAI API key (optional, for iteration 2+)
-export OPENAI_API_KEY="sk-your-key-here"
+# Set Google Gemini API key (optional, for LLM-enabled iterations)
+export GOOGLE_API_KEY="your-google-api-key-here"
 
 # Or add to .env file
-echo "OPENAI_API_KEY=sk-your-key-here" > .env
+echo "GOOGLE_API_KEY=your-google-api-key-here" > .env
 
 # Source .env if exists
 if [ -f .env ]; then source .env; fi
@@ -231,7 +231,7 @@ pip install -r requirements.txt --force-reinstall
 # A: Edit todo.md (markdown list format)
 
 # Q: Can it really improve itself?
-# A: Yes! But needs OpenAI API key in iteration 2+
+# A: Yes, if GOOGLE_API_KEY is configured and the Gemini call succeeds.
 
 # Q: How to add new tools?
 # A: Create tools/my_tool.py, document in tools.md

@@ -3,7 +3,7 @@
 # LLM Settings
 llm:
   provider: "google"  # openai, google, anthropic, local
-  model: "gemini-2.5-flash-preview-04-17"  # gemini-2.5-flash-preview-04-17, gemini-2.0-flash, gemini-1.5-pro
+  model: "gemini-2.5-flash"  # gemini-2.5-flash, gemini-2.5-pro, gemini-2.0-flash
   temperature: 0.7
   max_tokens: 2000
   api_key: "${GOOGLE_API_KEY}"  # From env

@@ -44,7 +44,7 @@ class APIClient:
                 "execution_time": float
             }
         """
-        url = urljoin(self.base_url, endpoint)
+        url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
         start_time = time.time()
         
         try:
@@ -146,7 +146,7 @@ class OpenAIClient(APIClient):
             **kwargs
         }
         
-        return self.call("/chat/completions", method="POST", data=data)
+        return self.call("chat/completions", method="POST", data=data)
     
     def get_response(self, messages: List[Dict[str, str]], **kwargs) -> Optional[str]:
         """
@@ -161,7 +161,7 @@ class OpenAIClient(APIClient):
 class GoogleGeminiClient(APIClient):
     """Google Gemini API client"""
 
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash-preview-04-17", timeout: int = 30):
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash", timeout: int = 30):
         super().__init__(
             base_url="https://generativelanguage.googleapis.com/v1beta",
             timeout=timeout
@@ -207,7 +207,7 @@ class GoogleGeminiClient(APIClient):
             }
         }
 
-        endpoint = f"/models/{self.model}:generateContent"
+        endpoint = f"models/{self.model}:generateContent"
         raw = self.call(endpoint, method="POST", data=data,
                         params={"key": self.api_key})
 
@@ -246,7 +246,7 @@ def create_llm_client(provider: str, api_key: str, model: str = None, timeout: i
         An LLM client with a .get_response(messages) method
     """
     if provider == "google":
-        return GoogleGeminiClient(api_key, model=model or "gemini-2.5-flash-preview-04-17", timeout=timeout)
+        return GoogleGeminiClient(api_key, model=model or "gemini-2.5-flash", timeout=timeout)
     if provider == "openai":
         return OpenAIClient(api_key, model=model or "gpt-4", timeout=timeout)
     raise ValueError(f"Unsupported LLM provider: '{provider}'. Use 'google' or 'openai'.")
