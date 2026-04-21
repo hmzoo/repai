@@ -22,6 +22,11 @@ agent:
   auto_tool_creation: true
   recursive_calls: true
 
+# Evolution Settings
+evolution:
+  enabled: true
+  max_tasks_per_iteration: 12
+
 # API Settings
 apis:
   google:

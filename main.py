@@ -110,10 +110,158 @@ class EvolutionaryAgent:
         self.timeout_per_iteration = self.config.get("execution", {}).get("timeout_per_iteration", 300)
         self.debug_mode = self.config.get("execution", {}).get("debug_mode", False)
         self.logging_config = self.config.get("logging", {})
+        self.evolution_config = self.config.get("evolution", {})
         self.iteration_log_path = self.logging_config.get("iteration_log", "iteration_log.md")
+        self.evolution_enabled = self.evolution_config.get("enabled", True)
+        self.max_tasks_per_iteration = self.evolution_config.get("max_tasks_per_iteration", 12)
         self.file_mgr = FileManager()
         self.start_time = datetime.now()
         self._prepare_iteration_log()
+
+    @staticmethod
+    def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
+        """Extract JSON payload from plain text or fenced markdown block."""
+        if not text:
+            return None
+
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = candidate[start:end + 1]
+
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                parsed = json.loads(text[start:end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                return None
+
+        return None
+
+    def _build_todo_content(self, tasks: List[str]) -> str:
+        """Build the markdown content for todo.md from task list."""
+        cleaned = [task.strip() for task in tasks if task and task.strip()]
+        if not cleaned:
+            cleaned = ["Review previous iteration results and define next concrete improvement"]
+
+        capped = cleaned[: self.max_tasks_per_iteration]
+        task_lines = "\n".join(f"- [ ] {task}" for task in capped)
+        return (
+            "# TODO - RepaI Task Backlog\n\n"
+            f"## Itération {self.iteration + 1} - Auto-generated\n\n"
+            "### Priorités\n"
+            f"{task_lines}\n\n"
+            "---\n\n"
+            f"**Itération courante** : {self.iteration + 1}\n"
+            "**Généré automatiquement** : yes\n"
+        )
+
+    def ask_llm_for_evolution_plan(self, system_prompt: str, todos: List[str], llm_summary: str) -> Dict[str, Any]:
+        """Ask the LLM for concrete updates to todo.md and system_prompt.md."""
+        client = self.get_llm_client()
+        if client is None:
+            return {
+                "success": False,
+                "error": "No LLM client configured.",
+                "plan": None,
+            }
+
+        task_preview = "\n".join(f"- {todo}" for todo in todos[:8]) or "- No pending tasks"
+        prompt = (
+            "You are evolving a recursive coding agent. Return ONLY valid JSON with this schema:\n"
+            "{\n"
+            "  \"next_tasks\": [\"task 1\", \"task 2\"],\n"
+            "  \"system_prompt_update\": \"full replacement text for system_prompt.md\",\n"
+            "  \"notes\": \"short explanation\"\n"
+            "}\n"
+            "Rules:\n"
+            "- next_tasks must contain 5 to 12 concrete tasks.\n"
+            "- system_prompt_update must stay concise and actionable.\n"
+            "- Do not include markdown code fences.\n\n"
+            f"Current system_prompt.md:\n{system_prompt[:3500]}\n\n"
+            f"Current tasks:\n{task_preview}\n\n"
+            f"Latest summary:\n{llm_summary[:1200]}"
+        )
+
+        raw_result = client.chat_completion(
+            [{"role": "user", "content": prompt}],
+            temperature=self.config.get("llm", {}).get("temperature", 0.7),
+            max_tokens=min(self.config.get("llm", {}).get("max_tokens", 2000), 1200),
+        )
+
+        if not raw_result.get("success"):
+            return {
+                "success": False,
+                "error": f"{raw_result.get('error', 'Unknown error')} (status={raw_result.get('status_code')})",
+                "plan": None,
+            }
+
+        try:
+            payload_text = raw_result["data"]["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return {
+                "success": False,
+                "error": "Could not parse LLM evolution response text.",
+                "plan": None,
+            }
+
+        parsed = self._extract_json_payload(payload_text)
+        if parsed is None:
+            return {
+                "success": False,
+                "error": "LLM evolution response was not valid JSON.",
+                "plan": None,
+            }
+
+        return {
+            "success": True,
+            "error": None,
+            "plan": parsed,
+        }
+
+    def apply_evolution_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply evolution plan by updating todo.md and system_prompt.md."""
+        next_tasks = plan.get("next_tasks")
+        system_prompt_update = plan.get("system_prompt_update")
+        notes = plan.get("notes", "")
+
+        result = {
+            "todo_updated": False,
+            "prompt_updated": False,
+            "notes": notes,
+            "errors": [],
+        }
+
+        if isinstance(next_tasks, list):
+            todo_content = self._build_todo_content([str(task) for task in next_tasks])
+            if self.file_mgr.write_markdown("todo.md", todo_content):
+                result["todo_updated"] = True
+            else:
+                result["errors"].append("Failed to write todo.md")
+        else:
+            result["errors"].append("Invalid or missing next_tasks in evolution plan")
+
+        if isinstance(system_prompt_update, str) and system_prompt_update.strip():
+            if self.file_mgr.write_markdown("system_prompt.md", system_prompt_update.strip() + "\n"):
+                result["prompt_updated"] = True
+            else:
+                result["errors"].append("Failed to write system_prompt.md")
+        else:
+            result["errors"].append("Invalid or missing system_prompt_update in evolution plan")
+
+        return result
 
     def _prepare_iteration_log(self):
         """Prepare the iteration log file at startup based on logging settings."""
@@ -305,6 +453,9 @@ class EvolutionaryAgent:
             "checks": [],
             "llm_summary": None,
             "llm_error": None,
+            "evolution_applied": False,
+            "evolution_notes": None,
+            "evolution_errors": [],
         }
         
         # Load system prompt
@@ -342,6 +493,21 @@ class EvolutionaryAgent:
             print(f"⚠️  LLM call failed: {iteration_data['llm_error']}")
         else:
             print(f"ℹ️  Running in dry-run mode: {iteration_data['llm_error']}")
+
+        if self.evolution_enabled and iteration_data["llm_summary"]:
+            evolution_result = self.ask_llm_for_evolution_plan(system_prompt, todos, iteration_data["llm_summary"])
+            if evolution_result["success"]:
+                applied = self.apply_evolution_plan(evolution_result["plan"])
+                iteration_data["evolution_applied"] = applied["todo_updated"] or applied["prompt_updated"]
+                iteration_data["evolution_notes"] = applied.get("notes") or evolution_result["plan"].get("notes")
+                iteration_data["evolution_errors"] = applied.get("errors", [])
+                if iteration_data["evolution_applied"]:
+                    print("🛠️  Evolution applied: updated todo.md and/or system_prompt.md")
+                if iteration_data["evolution_errors"]:
+                    print(f"⚠️  Evolution issues: {'; '.join(iteration_data['evolution_errors'])}")
+            else:
+                iteration_data["evolution_errors"] = [evolution_result["error"]]
+                print(f"⚠️  Evolution plan generation failed: {evolution_result['error']}")
         
         iteration_data["status"] = "completed"
         iteration_data["execution_time"] = (datetime.now() - self.start_time).total_seconds()
@@ -358,6 +524,10 @@ class EvolutionaryAgent:
         ) or "- No checks executed"
 
         llm_block = data.get("llm_summary") or f"No LLM summary generated during this iteration. {data.get('llm_error', '')}".strip()
+        evolution_errors = data.get("evolution_errors", [])
+        evolution_status = "applied" if data.get("evolution_applied") else "not_applied"
+        evolution_notes = data.get("evolution_notes") or "No evolution notes provided."
+        evolution_error_block = "\n".join(f"- {err}" for err in evolution_errors) if evolution_errors else "- None"
         log_entry = f"""
 ### Itération {data['iteration']}
 **Timestamp** : {data['timestamp']}  
@@ -371,6 +541,11 @@ class EvolutionaryAgent:
 
 **Résumé LLM / évolution** :
 {llm_block}
+
+**Application d'évolution** : {evolution_status}
+**Notes d'évolution** : {evolution_notes}
+**Erreurs d'évolution** :
+{evolution_error_block}
 
 ---
 """
