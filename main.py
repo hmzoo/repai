@@ -184,12 +184,18 @@ class EvolutionaryAgent:
             "{\n"
             "  \"next_tasks\": [\"task 1\", \"task 2\"],\n"
             "  \"system_prompt_update\": \"full replacement text for system_prompt.md\",\n"
+            "  \"code_files\": [\n"
+            "    {\"path\": \"tools/my_module.py\", \"content\": \"# full file content\"}\n"
+            "  ],\n"
             "  \"notes\": \"short explanation\"\n"
             "}\n"
             "Rules:\n"
             "- next_tasks must contain 5 to 12 concrete tasks.\n"
             "- system_prompt_update must stay concise and actionable.\n"
-            "- Do not include markdown code fences.\n\n"
+            "- code_files is optional. Only include it when you are ready to write real, working Python code.\n"
+            "- Each path in code_files must be a relative path inside the project (e.g. tools/tool_registry.py). No path traversal.\n"
+            "- Only write .py files. content must be the full file content, not a snippet.\n"
+            "- Do not include markdown code fences anywhere in the JSON.\n\n"
             f"Current system_prompt.md:\n{system_prompt[:3500]}\n\n"
             f"Current tasks:\n{task_preview}\n\n"
             f"Latest summary:\n{llm_summary[:1200]}"
@@ -198,7 +204,7 @@ class EvolutionaryAgent:
         raw_result = client.chat_completion(
             [{"role": "user", "content": prompt}],
             temperature=self.config.get("llm", {}).get("temperature", 0.7),
-            max_tokens=min(self.config.get("llm", {}).get("max_tokens", 2000), 1200),
+            max_tokens=min(self.config.get("llm", {}).get("max_tokens", 8000), 8000),
         )
 
         if not raw_result.get("success"):
@@ -260,6 +266,30 @@ class EvolutionaryAgent:
                 result["errors"].append("Failed to write system_prompt.md")
         else:
             result["errors"].append("Invalid or missing system_prompt_update in evolution plan")
+
+        code_files = plan.get("code_files")
+        result["code_files_written"] = []
+        if isinstance(code_files, list):
+            for entry in code_files:
+                if not isinstance(entry, dict):
+                    continue
+                file_path = entry.get("path", "").strip()
+                content = entry.get("content", "")
+                # Security: reject path traversal and non-.py files
+                safe_path = Path(file_path)
+                if ".." in safe_path.parts or not file_path.endswith(".py"):
+                    result["errors"].append(f"Rejected unsafe/non-py path: {file_path}")
+                    continue
+                if not isinstance(content, str) or not content.strip():
+                    result["errors"].append(f"Empty content for {file_path}, skipped")
+                    continue
+                try:
+                    safe_path.parent.mkdir(parents=True, exist_ok=True)
+                    safe_path.write_text(content, encoding="utf-8")
+                    result["code_files_written"].append(file_path)
+                    print(f"📝  Code file written: {file_path}")
+                except Exception as exc:
+                    result["errors"].append(f"Failed to write {file_path}: {exc}")
 
         return result
 
@@ -503,6 +533,9 @@ class EvolutionaryAgent:
                 iteration_data["evolution_errors"] = applied.get("errors", [])
                 if iteration_data["evolution_applied"]:
                     print("🛠️  Evolution applied: updated todo.md and/or system_prompt.md")
+                code_written = applied.get("code_files_written", [])
+                if code_written:
+                    print(f"🧬  Code evolution: {len(code_written)} file(s) written → {', '.join(code_written)}")
                 if iteration_data["evolution_errors"]:
                     print(f"⚠️  Evolution issues: {'; '.join(iteration_data['evolution_errors'])}")
             else:
