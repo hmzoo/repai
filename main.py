@@ -9,6 +9,7 @@ import sys
 import json
 import time
 import shutil
+import ast
 import yaml
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Dict, Any, Optional, List
 
 from tools.task_executor import execute_task
 from tools.api_caller import create_llm_client
+from tools.runtime_registry import RuntimeToolRegistry
 
 # Load environment variables from .env file if it exists
 try:
@@ -111,12 +113,47 @@ class EvolutionaryAgent:
         self.debug_mode = self.config.get("execution", {}).get("debug_mode", False)
         self.logging_config = self.config.get("logging", {})
         self.evolution_config = self.config.get("evolution", {})
+        self.registry_config = self.config.get("registry", {})
         self.iteration_log_path = self.logging_config.get("iteration_log", "iteration_log.md")
         self.evolution_enabled = self.evolution_config.get("enabled", True)
         self.max_tasks_per_iteration = self.evolution_config.get("max_tasks_per_iteration", 12)
+        self.evolution_interval = max(1, int(self.evolution_config.get("full_update_interval", 2)))
+        legacy_evolution_budget = int(self.evolution_config.get("max_tokens", 1200))
+        self.evolution_max_tokens_base = max(
+            400,
+            int(self.evolution_config.get("max_tokens_base", legacy_evolution_budget)),
+        )
+        self.evolution_max_tokens_with_code = max(
+            self.evolution_max_tokens_base,
+            int(self.evolution_config.get("max_tokens_with_code", 2400)),
+        )
+        self.workspace_scan_interval = max(1, int(self.config.get("execution", {}).get("workspace_scan_interval", 5)))
         self.file_mgr = FileManager()
+        self.runtime_registry = RuntimeToolRegistry(
+            load_system_prompt=self.load_system_prompt,
+            analyze_iteration_log=self._analyze_iteration_log,
+            plan_next_iteration=self._plan_next_iteration_from_analysis,
+            strict_mode=bool(self.registry_config.get("strict_mode", True)),
+        )
         self.start_time = datetime.now()
         self._prepare_iteration_log()
+
+    @staticmethod
+    def _needs_code_budget(todos: List[str], llm_summary: str) -> bool:
+        """Return True when context suggests code-file generation is likely needed."""
+        text = "\n".join(todos + [llm_summary or ""]).lower()
+        code_markers = [
+            "code_files",
+            "tools/",
+            "create file",
+            "write file",
+            "implement",
+            "refactor",
+            ".py",
+            "unit test",
+            "generate",
+        ]
+        return any(marker in text for marker in code_markers)
 
     @staticmethod
     def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
@@ -196,6 +233,80 @@ class EvolutionaryAgent:
             "**Généré automatiquement** : yes\n"
         )
 
+    @staticmethod
+    def _is_meta_task(task: str) -> bool:
+        """Return True when a task is mostly planning/reflection instead of implementation."""
+        lowered = task.lower()
+        meta_markers = [
+            "analyze",
+            "analysis",
+            "plan",
+            "read",
+            "review",
+            "summar",
+            "update system_prompt",
+            "write todo",
+            "iteration_log",
+            "self-reflection",
+        ]
+        return any(marker in lowered for marker in meta_markers)
+
+    def _normalize_evolution_plan(self, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Validate and rebalance plans that are too meta/repetitive."""
+        if not isinstance(plan, dict):
+            return None
+
+        next_tasks_raw = plan.get("next_tasks", [])
+        if not isinstance(next_tasks_raw, list):
+            next_tasks_raw = []
+
+        deduped_tasks: List[str] = []
+        for task in next_tasks_raw:
+            task_text = str(task).strip()
+            if task_text and task_text not in deduped_tasks:
+                deduped_tasks.append(task_text)
+
+        code_files = plan.get("code_files")
+        valid_code_files = []
+        if isinstance(code_files, list):
+            for entry in code_files:
+                if not isinstance(entry, dict):
+                    continue
+                path = str(entry.get("path", "")).strip()
+                content = entry.get("content")
+                if path.endswith(".py") and isinstance(content, str) and content.strip():
+                    valid_code_files.append(entry)
+
+        meta_count = sum(1 for task in deduped_tasks if self._is_meta_task(task))
+        meta_ratio = (meta_count / len(deduped_tasks)) if deduped_tasks else 1.0
+        has_concrete_task = any(not self._is_meta_task(task) for task in deduped_tasks)
+        has_code_deliverable = len(valid_code_files) > 0
+        executable_ratio = (
+            sum(1 for task in deduped_tasks if self._parse_tool_call(task) is not None) / len(deduped_tasks)
+            if deduped_tasks else 0.0
+        )
+
+        if meta_ratio >= 0.7 and not has_concrete_task and not has_code_deliverable:
+            fallback_tasks = [
+                "Implement one missing tool module in tools/ and include complete Python code",
+                "Add or update at least one unit test covering new or changed tool behavior",
+                "Run a local validation command and record concrete pass/fail output in iteration_log.md",
+            ]
+            deduped_tasks = (fallback_tasks + deduped_tasks)[: self.max_tasks_per_iteration]
+            existing_notes = str(plan.get("notes", "")).strip()
+            correction = "Auto-corrected meta-heavy plan with concrete implementation tasks."
+            plan["notes"] = f"{correction} {existing_notes}".strip()
+
+        if executable_ratio < 0.6:
+            executable_fallback = self._default_executable_tasks()
+            deduped_tasks = executable_fallback[: self.max_tasks_per_iteration]
+            existing_notes = str(plan.get("notes", "")).strip()
+            correction = "Auto-corrected non-executable tasks to explicit tool-call format."
+            plan["notes"] = f"{correction} {existing_notes}".strip()
+
+        plan["next_tasks"] = deduped_tasks[: self.max_tasks_per_iteration]
+        return plan
+
     def ask_llm_for_evolution_plan(self, system_prompt: str, todos: List[str], llm_summary: str) -> Dict[str, Any]:
         """Ask the LLM for concrete updates to todo.md and system_prompt.md."""
         client = self.get_llm_client()
@@ -206,7 +317,7 @@ class EvolutionaryAgent:
                 "plan": None,
             }
 
-        task_preview = "\n".join(f"- {todo}" for todo in todos[:8]) or "- No pending tasks"
+        task_preview = "\n".join(f"- {todo}" for todo in todos[:6]) or "- No pending tasks"
         prompt = (
             "You are evolving a recursive coding agent. Return ONLY valid JSON with this schema:\n"
             "{\n"
@@ -223,16 +334,26 @@ class EvolutionaryAgent:
             "- code_files is optional. Only include it when you are ready to write real, working Python code.\n"
             "- Each path in code_files must be a relative path inside the project (e.g. tools/tool_registry.py). No path traversal.\n"
             "- Only write .py files. content must be the full file content, not a snippet.\n"
+            "- At least 30% of next_tasks must be concrete build/test/implementation tasks (not only analysis/planning).\n"
+            "- Every item in next_tasks MUST be an explicit tool call string formatted exactly as tool_name.method_name(arg=\"value\").\n"
+            "- Only use canonical tool calls from this allow-list: "
+            f"{', '.join(self.runtime_registry.allowed_call_strings())}.\n"
             "- Do not include markdown code fences anywhere in the JSON.\n\n"
-            f"Current system_prompt.md:\n{system_prompt[:3500]}\n\n"
+            f"Current system_prompt.md:\n{system_prompt[:1800]}\n\n"
             f"Current tasks:\n{task_preview}\n\n"
-            f"Latest summary:\n{llm_summary[:1200]}"
+            f"Latest summary:\n{llm_summary[:600]}"
+        )
+
+        adaptive_budget = (
+            self.evolution_max_tokens_with_code
+            if self._needs_code_budget(todos, llm_summary)
+            else self.evolution_max_tokens_base
         )
 
         raw_result = client.chat_completion(
             [{"role": "user", "content": prompt}],
             temperature=self.config.get("llm", {}).get("temperature", 0.7),
-            max_tokens=min(self.config.get("llm", {}).get("max_tokens", 8000), 8000),
+            max_tokens=min(self.config.get("llm", {}).get("max_tokens", 2000), adaptive_budget),
             thinking_budget=0,
             response_schema={
                 "type": "object",
@@ -242,7 +363,10 @@ class EvolutionaryAgent:
                         "type": "array",
                         "minItems": 5,
                         "maxItems": 12,
-                        "items": {"type": "string"},
+                        "items": {
+                            "type": "string",
+                            "pattern": "^[a-z_]+\\.[a-z_]+\\(.*\\)$",
+                        },
                     },
                     "system_prompt_update": {"type": "string"},
                     "code_files": {
@@ -285,10 +409,18 @@ class EvolutionaryAgent:
                 "plan": None,
             }
 
+        normalized = self._normalize_evolution_plan(parsed)
+        if normalized is None:
+            return {
+                "success": False,
+                "error": "LLM evolution plan was invalid or incomplete.",
+                "plan": None,
+            }
+
         return {
             "success": True,
             "error": None,
-            "plan": parsed,
+            "plan": normalized,
         }
 
     def apply_evolution_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -407,15 +539,19 @@ class EvolutionaryAgent:
         except Exception:
             return None
 
-    def run_builtin_checks(self) -> List[Dict[str, Any]]:
+    def run_builtin_checks(self, full_scan: bool = True) -> List[Dict[str, Any]]:
         """Execute a small set of real checks so each iteration does visible work."""
         checks = []
 
-        file_count = len(list(Path(".").glob("**/*")))
+        if full_scan:
+            file_count = len(list(Path(".").glob("**/*")))
+            scan_summary = f"Workspace scan complete: {file_count} paths detected."
+        else:
+            scan_summary = f"Workspace scan skipped on this iteration (interval={self.workspace_scan_interval})."
         checks.append({
             "name": "workspace_scan",
             "success": True,
-            "summary": f"Workspace scan complete: {file_count} paths detected.",
+            "summary": scan_summary,
         })
 
         python_check = execute_task(
@@ -457,7 +593,7 @@ class EvolutionaryAgent:
                 "error": "No LLM client configured from current environment.",
             }
 
-        task_preview = "\n".join(f"- {todo}" for todo in todos[:5]) or "- No pending tasks"
+        task_preview = "\n".join(f"- {todo}" for todo in todos[:4]) or "- No pending tasks"
         messages = [
             {
                 "role": "user",
@@ -465,7 +601,7 @@ class EvolutionaryAgent:
                     "You are summarizing the current iteration of a self-improving coding agent. "
                     "Return 3 short bullet points: 1) what the agent should do now, "
                     "2) the main risk, 3) the next concrete improvement.\n\n"
-                    f"System prompt excerpt:\n{system_prompt[:1200]}\n\n"
+                    f"System prompt excerpt:\n{system_prompt[:700]}\n\n"
                     f"Pending tasks:\n{task_preview}"
                 ),
             }
@@ -474,7 +610,7 @@ class EvolutionaryAgent:
         raw_result = client.chat_completion(
             messages,
             temperature=self.config.get("llm", {}).get("temperature", 0.7),
-            max_tokens=min(self.config.get("llm", {}).get("max_tokens", 2000), 300),
+            max_tokens=min(self.config.get("llm", {}).get("max_tokens", 2000), 220),
         )
 
         if not raw_result.get("success"):
@@ -514,6 +650,107 @@ class EvolutionaryAgent:
                 if task:
                     todos.append(task)
         return todos
+
+    @staticmethod
+    def _parse_tool_call(task: str) -> Optional[Dict[str, Any]]:
+        """Parse a task string in the form tool.method(arg="value")."""
+        try:
+            node = ast.parse(task, mode="eval")
+        except SyntaxError:
+            return None
+
+        expr = node.body
+        if not isinstance(expr, ast.Call):
+            return None
+        if not isinstance(expr.func, ast.Attribute):
+            return None
+        if not isinstance(expr.func.value, ast.Name):
+            return None
+
+        tool = expr.func.value.id
+        method = expr.func.attr
+        kwargs: Dict[str, Any] = {}
+        for kw in expr.keywords:
+            if kw.arg is None:
+                return None
+            try:
+                kwargs[kw.arg] = ast.literal_eval(kw.value)
+            except Exception:
+                return None
+
+        return {
+            "tool": tool,
+            "method": method,
+            "kwargs": kwargs,
+        }
+
+    def _analyze_iteration_log(self, log_text: str) -> str:
+        """Create a compact analysis summary from iteration log content."""
+        lines = log_text.splitlines()
+        total_iterations = sum(1 for line in lines if line.startswith("### Itération"))
+        warnings = sum(1 for line in lines if "WARN" in line or "⚠️" in line)
+        evol_applied = sum(1 for line in lines if "**Application d'évolution** : applied" in line)
+        return (
+            f"iterations={total_iterations}; evolution_applied={evol_applied}; "
+            f"warnings={warnings}; recommendation=prioritize concrete tool/test implementation"
+        )
+
+    def _plan_next_iteration_from_analysis(self, analysis: str) -> str:
+        """Generate deterministic concrete tasks from analysis text."""
+        tasks = [
+            "Implement one concrete Python tool in tools/ with complete function bodies",
+            "Add at least one unit test for a changed or new tool",
+            "Run a local validation command and record output in iteration_log.md",
+            "Update tools.md to document any newly added tool",
+            f"Review analysis summary and adjust backlog priorities: {analysis[:100]}",
+        ]
+        return self._build_todo_content(tasks)
+
+    def _default_executable_tasks(self) -> List[str]:
+        """Default executable task chain used as local fallback."""
+        return [
+            "file_manager.read_file(path=\"iteration_log.md\")",
+            "analyze_results.analyze_iteration_log(log_content=\"[RESULTS_FROM_file_manager.read_file(path=\\\"iteration_log.md\\\")]\")",
+            "file_manager.read_file(path=\"system_prompt.md\")",
+            "system_prompt_manager.update_system_prompt(current_prompt=\"[RESULTS_FROM_file_manager.read_file(path=\\\"system_prompt.md\\\")]\", analysis_results=\"[RESULTS_FROM_analyze_results.analyze_iteration_log]\")",
+            "file_manager.write_file(path=\"system_prompt.md\", content=\"[RESULTS_FROM_system_prompt_manager.update_system_prompt]\")",
+            "plan_next_iteration.plan(analysis_results=\"[RESULTS_FROM_analyze_results.analyze_iteration_log]\")",
+            "file_manager.write_file(path=\"todo.md\", content=\"[RESULTS_FROM_plan_next_iteration.plan]\")",
+            "shell_executor.execute_shell_command(command=\"python3 --version\", timeout=15)",
+        ]
+
+    def execute_todos(self, todos: List[str]) -> List[Dict[str, Any]]:
+        """Execute tool-call tasks from todo.md and keep a result map for chaining."""
+        execution_results: List[Dict[str, Any]] = []
+        result_map: Dict[str, Any] = {}
+
+        for task in todos:
+            parsed = self._parse_tool_call(task)
+            if parsed is None:
+                execution_results.append({
+                    "task": task,
+                    "success": False,
+                    "error": "Task is not a parsable tool call (tool.method(...))",
+                })
+                continue
+
+            result = self.runtime_registry.execute(parsed, result_map)
+            call_key = f"{parsed['tool']}.{parsed['method']}"
+            output_value = result.get("output") if result.get("success") else result.get("error", "")
+            result_map[task] = output_value
+            normalized_tool, normalized_method = self.runtime_registry.normalize_call(parsed["tool"], parsed["method"])
+            if (normalized_tool, normalized_method) != (parsed["tool"], parsed["method"]):
+                result_map[f"{normalized_tool}.{normalized_method}"] = output_value
+            result_map[call_key] = output_value
+
+            execution_results.append({
+                "task": task,
+                "success": result.get("success", False),
+                "error": result.get("error"),
+                "output_preview": str(output_value)[:160],
+            })
+
+        return execution_results
     
     def execute_iteration(self) -> Dict[str, Any]:
         """
@@ -523,6 +760,8 @@ class EvolutionaryAgent:
         3. Log results
         4. Prepare evolution for next iteration
         """
+        iteration_start = datetime.now()
+
         print(f"\n{'='*60}")
         print(f"ITERATION {self.iteration}")
         print(f"{'='*60}\n")
@@ -540,6 +779,7 @@ class EvolutionaryAgent:
             "evolution_applied": False,
             "evolution_notes": None,
             "evolution_errors": [],
+            "task_results": [],
         }
         
         # Load system prompt
@@ -554,7 +794,13 @@ class EvolutionaryAgent:
         for i, todo in enumerate(todos[:3], 1):  # Show first 3
             print(f"   {i}. {todo[:50]}...")
 
-        iteration_data["checks"] = self.run_builtin_checks()
+        iteration_data["task_results"] = self.execute_todos(todos)
+        executed_ok = sum(1 for res in iteration_data["task_results"] if res.get("success"))
+        executed_total = len(iteration_data["task_results"])
+        print(f"🧪 Executed TODO tool calls: {executed_ok}/{executed_total} succeeded")
+
+        do_full_scan = self.iteration == 1 or self.iteration % self.workspace_scan_interval == 0
+        iteration_data["checks"] = self.run_builtin_checks(full_scan=do_full_scan)
         print("🔎 Built-in checks:")
         for check in iteration_data["checks"]:
             icon = "✅" if check["success"] else "⚠️"
@@ -578,7 +824,12 @@ class EvolutionaryAgent:
         else:
             print(f"ℹ️  Running in dry-run mode: {iteration_data['llm_error']}")
 
-        if self.evolution_enabled and iteration_data["llm_summary"]:
+        should_run_evolution = (
+            self.evolution_enabled
+            and iteration_data["llm_summary"]
+            and (self.iteration == 1 or self.iteration % self.evolution_interval == 0)
+        )
+        if should_run_evolution:
             evolution_result = self.ask_llm_for_evolution_plan(system_prompt, todos, iteration_data["llm_summary"])
             if evolution_result["success"]:
                 applied = self.apply_evolution_plan(evolution_result["plan"])
@@ -595,9 +846,18 @@ class EvolutionaryAgent:
             else:
                 iteration_data["evolution_errors"] = [evolution_result["error"]]
                 print(f"⚠️  Evolution plan generation failed: {evolution_result['error']}")
+        elif self.evolution_enabled and iteration_data["llm_summary"]:
+            iteration_data["evolution_notes"] = (
+                f"Skipped full evolution this iteration to reduce churn "
+                f"(full_update_interval={self.evolution_interval})."
+            )
+            print(
+                "⏭️  Evolution skipped this iteration "
+                f"(full_update_interval={self.evolution_interval})"
+            )
         
         iteration_data["status"] = "completed"
-        iteration_data["execution_time"] = (datetime.now() - self.start_time).total_seconds()
+        iteration_data["execution_time"] = (datetime.now() - iteration_start).total_seconds()
         
         self._log_iteration(iteration_data)
         
@@ -609,6 +869,12 @@ class EvolutionaryAgent:
             f"- {'OK' if check['success'] else 'WARN'} {check['name']}: {check['summary']}"
             for check in data.get("checks", [])
         ) or "- No checks executed"
+
+        task_results = data.get("task_results", [])
+        tasks_block = "\n".join(
+            f"- {'OK' if task.get('success') else 'WARN'} {task.get('task')}: {task.get('output_preview') or task.get('error', '')}"
+            for task in task_results[:10]
+        ) or "- No tasks executed"
 
         llm_block = data.get("llm_summary") or f"No LLM summary generated during this iteration. {data.get('llm_error', '')}".strip()
         evolution_errors = data.get("evolution_errors", [])
@@ -622,6 +888,9 @@ class EvolutionaryAgent:
 **Mode** : {data.get('mode', 'unknown')}  
 **Temps d'exécution** : {data.get('execution_time', 0):.2f}s  
 **Tâches traitées** : {len(data.get('todos', []))}  
+
+**Exécution des tâches TODO** :
+{tasks_block}
 
 **Vérifications exécutées** :
 {checks_block}

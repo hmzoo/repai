@@ -14,6 +14,7 @@ execution:
   timeout_per_iteration: 300  # seconds
   debug_mode: true
   log_all_api_calls: true
+  workspace_scan_interval: 5  # run full workspace scan every N iterations
 
 # Agent Settings
 agent:
@@ -26,6 +27,14 @@ agent:
 evolution:
   enabled: true
   max_tasks_per_iteration: 12
+  full_update_interval: 2  # apply full prompt/todo evolution every N iterations
+  max_tokens: 1200  # legacy compatibility fallback
+  max_tokens_base: 1200  # default budget for compact evolution output
+  max_tokens_with_code: 2400  # higher budget when code generation is likely
+
+# Runtime Registry Settings
+registry:
+  strict_mode: true  # reject aliases and require canonical tool calls
 
 # API Settings
 apis:

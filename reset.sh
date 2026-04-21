@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET_REF="${1:-v1.0-base-structured-json}"
+TARGET_REF="${1:-v1.0-base-strict-canonical}"
 
 cd "$ROOT_DIR"
 
