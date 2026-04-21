@@ -10,6 +10,9 @@ import json
 import time
 import shutil
 import ast
+import argparse
+import hashlib
+import traceback
 import yaml
 from datetime import datetime
 from pathlib import Path
@@ -128,6 +131,7 @@ class EvolutionaryAgent:
             int(self.evolution_config.get("max_tokens_with_code", 2400)),
         )
         self.workspace_scan_interval = max(1, int(self.config.get("execution", {}).get("workspace_scan_interval", 5)))
+        self.auto_fix_max_attempts = max(1, int(self.config.get("execution", {}).get("auto_fix_max_attempts", 3)))
         self.file_mgr = FileManager()
         self.runtime_registry = RuntimeToolRegistry(
             load_system_prompt=self.load_system_prompt,
@@ -135,6 +139,9 @@ class EvolutionaryAgent:
             plan_next_iteration=self._plan_next_iteration_from_analysis,
             strict_mode=bool(self.registry_config.get("strict_mode", True)),
         )
+        self.error_memory: Dict[str, Dict[str, Any]] = {}
+        self.active_blockers: List[Dict[str, str]] = []
+        self.todo_fingerprint_history: List[str] = []
         self.start_time = datetime.now()
         self._prepare_iteration_log()
 
@@ -719,6 +726,92 @@ class EvolutionaryAgent:
             "shell_executor.execute_shell_command(command=\"python3 --version\", timeout=15)",
         ]
 
+    @staticmethod
+    def _todo_fingerprint(todos: List[str]) -> str:
+        normalized = "\n".join(task.strip().lower() for task in todos[:12])
+        return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
+    def _is_stagnating(self, todos: List[str]) -> bool:
+        if len(todos) == 0:
+            return False
+        fp = self._todo_fingerprint(todos)
+        recent = self.todo_fingerprint_history[-2:]
+        return len(recent) == 2 and recent[0] == fp and recent[1] == fp
+
+    @staticmethod
+    def _extract_error_signature(error_text: str) -> str:
+        first_line = (error_text or "").strip().splitlines()[0] if error_text else "unknown_error"
+        return first_line[:220]
+
+    def _register_error(self, task: str, error_text: str):
+        signature = self._extract_error_signature(error_text)
+        entry = self.error_memory.get(signature, {"count": 0, "last_task": ""})
+        entry["count"] += 1
+        entry["last_task"] = task
+        self.error_memory[signature] = entry
+
+    def _build_blocker_tasks(self, blockers: List[Dict[str, str]]) -> List[str]:
+        tasks = []
+        for blocker in blockers[:3]:
+            task = blocker.get("task", "")
+            error = blocker.get("error", "")
+            if "SyntaxError" in error:
+                tasks.append("shell_executor.execute_shell_command(command=\"python3 -m unittest tests/test_documentation.py\", timeout=30)")
+            if "File not found:" in error:
+                missing = error.split("File not found:", 1)[-1].strip()
+                tasks.append(f"file_manager.write_file(path=\"{missing}\", content=\"# Auto-created placeholder to unblock execution\\n\")")
+            if task.startswith("shell_executor.execute_shell_command"):
+                tasks.append(task)
+
+        tasks.append("analyze_results.analyze_iteration_log(log_path=\"iteration_log.md\")")
+        deduped = []
+        for task in tasks:
+            if task and task not in deduped:
+                deduped.append(task)
+        return deduped[: self.max_tasks_per_iteration]
+
+    @staticmethod
+    def _extract_syntax_error_location(error_text: str) -> Optional[Dict[str, Any]]:
+        lines = (error_text or "").splitlines()
+        file_path = None
+        line_no = None
+        for line in lines:
+            marker = 'File "'
+            if marker in line and '", line ' in line:
+                try:
+                    start = line.index(marker) + len(marker)
+                    mid = line.index('", line ', start)
+                    file_path = line[start:mid]
+                    line_no = int(line[mid + 8:].strip())
+                except Exception:
+                    continue
+        if file_path and line_no:
+            return {"path": file_path, "line": line_no}
+        return None
+
+    def _auto_fix_task_failure(self, parsed: Dict[str, Any], result: Dict[str, Any]) -> bool:
+        error_text = str(result.get("error") or "")
+        location = self._extract_syntax_error_location(error_text)
+        if not location or "SyntaxError: unmatched ')'" not in error_text:
+            return False
+
+        target = Path(location["path"])
+        if not target.exists():
+            return False
+        try:
+            lines = target.read_text(encoding="utf-8").splitlines()
+            idx = location["line"] - 1
+            if idx < 0 or idx >= len(lines):
+                return False
+            line = lines[idx]
+            if ")" not in line:
+                return False
+            lines[idx] = line.replace(")", "", 1) if line.count(")") == 1 else line[::-1].replace(")", "", 1)[::-1]
+            target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
     def execute_todos(self, todos: List[str]) -> List[Dict[str, Any]]:
         """Execute tool-call tasks from todo.md and keep a result map for chaining."""
         execution_results: List[Dict[str, Any]] = []
@@ -735,6 +828,16 @@ class EvolutionaryAgent:
                 continue
 
             result = self.runtime_registry.execute(parsed, result_map)
+            if not result.get("success") and parsed.get("tool") == "shell_executor" and parsed.get("method") == "execute_shell_command":
+                for _ in range(self.auto_fix_max_attempts):
+                    if not self._auto_fix_task_failure(parsed, result):
+                        break
+                    retry = self.runtime_registry.execute(parsed, result_map)
+                    if retry.get("success"):
+                        result = retry
+                        break
+                    result = retry
+
             call_key = f"{parsed['tool']}.{parsed['method']}"
             output_value = result.get("output") if result.get("success") else result.get("error", "")
             result_map[task] = output_value
@@ -742,6 +845,9 @@ class EvolutionaryAgent:
             if (normalized_tool, normalized_method) != (parsed["tool"], parsed["method"]):
                 result_map[f"{normalized_tool}.{normalized_method}"] = output_value
             result_map[call_key] = output_value
+
+            if not result.get("success"):
+                self._register_error(task, str(result.get("error") or ""))
 
             execution_results.append({
                 "task": task,
@@ -790,6 +896,19 @@ class EvolutionaryAgent:
         
         # Load TODOs
         todos = self.load_todos()
+        if self.active_blockers:
+            blocker_tasks = self._build_blocker_tasks(self.active_blockers)
+            if blocker_tasks:
+                todos = blocker_tasks + [task for task in todos if task not in blocker_tasks]
+                print(f"🚧 Blocker-first mode: injected {len(blocker_tasks)} remediation task(s)")
+
+        if self._is_stagnating(todos):
+            todos = self._default_executable_tasks()
+            print("♻️  Stagnation detected: switched to corrective default task chain")
+
+        self.todo_fingerprint_history.append(self._todo_fingerprint(todos))
+        self.todo_fingerprint_history = self.todo_fingerprint_history[-8:]
+
         print(f"📋 Loaded {len(todos)} tasks")
         for i, todo in enumerate(todos[:3], 1):  # Show first 3
             print(f"   {i}. {todo[:50]}...")
@@ -798,6 +917,21 @@ class EvolutionaryAgent:
         executed_ok = sum(1 for res in iteration_data["task_results"] if res.get("success"))
         executed_total = len(iteration_data["task_results"])
         print(f"🧪 Executed TODO tool calls: {executed_ok}/{executed_total} succeeded")
+
+        blockers = [
+            {"task": res.get("task", ""), "error": str(res.get("error") or "")}
+            for res in iteration_data["task_results"]
+            if not res.get("success")
+        ]
+        iteration_data["blockers"] = blockers
+        self.active_blockers = blockers
+
+        critical_test_tasks = [
+            res for res in iteration_data["task_results"]
+            if "python -m unittest" in (res.get("task") or "")
+        ]
+        critical_test_passed = any(res.get("success") for res in critical_test_tasks)
+        iteration_data["critical_test_passed"] = critical_test_passed
 
         do_full_scan = self.iteration == 1 or self.iteration % self.workspace_scan_interval == 0
         iteration_data["checks"] = self.run_builtin_checks(full_scan=do_full_scan)
@@ -856,7 +990,10 @@ class EvolutionaryAgent:
                 f"(full_update_interval={self.evolution_interval})"
             )
         
-        iteration_data["status"] = "completed"
+        if blockers and not critical_test_passed:
+            iteration_data["status"] = "blocked"
+        else:
+            iteration_data["status"] = "completed"
         iteration_data["execution_time"] = (datetime.now() - iteration_start).total_seconds()
         
         self._log_iteration(iteration_data)
@@ -938,8 +1075,31 @@ class EvolutionaryAgent:
 
 def main():
     """Entry point"""
+    parser = argparse.ArgumentParser(description="Run RepaI evolutionary agent")
+    parser.add_argument(
+        "iterations",
+        nargs="?",
+        type=int,
+        help="Optional positional override for max iterations",
+    )
+    parser.add_argument(
+        "-n",
+        "--iterations",
+        dest="iterations_flag",
+        type=int,
+        help="Override max iterations from config",
+    )
+    args = parser.parse_args()
+
+    iterations_override = args.iterations_flag if args.iterations_flag is not None else args.iterations
+    if iterations_override is not None and iterations_override < 1:
+        parser.error("iterations must be >= 1")
+
     config = Config()
     agent = EvolutionaryAgent(config)
+    if iterations_override is not None:
+        agent.max_iterations = iterations_override
+        print(f"🧮 Max iterations overridden by CLI: {iterations_override}")
     agent.run()
 
 

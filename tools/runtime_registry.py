@@ -108,7 +108,10 @@ class RuntimeToolRegistry:
                 path = str(kwargs.get("path", "")).strip()
                 if not path:
                     return {"success": False, "error": "Missing path"}
-                content = Path(path).read_text(encoding="utf-8") if Path(path).exists() else ""
+                target = Path(path)
+                if not target.exists():
+                    return {"success": False, "error": f"File not found: {path}"}
+                content = target.read_text(encoding="utf-8")
                 return {"success": True, "output": content}
 
             if tool == "file_manager" and method == "write_file":
@@ -147,7 +150,9 @@ class RuntimeToolRegistry:
             if tool == "analyze_results" and method == "analyze_iteration_log":
                 if "log_path" in kwargs:
                     log_path = Path(str(kwargs.get("log_path", "")))
-                    log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+                    if not log_path.exists():
+                        return {"success": False, "error": f"Log file not found: {log_path}"}
+                    log_text = log_path.read_text(encoding="utf-8")
                 else:
                     log_text = str(kwargs.get("log_content", ""))
                 return {"success": True, "output": self.analyze_iteration_log(log_text)}
