@@ -1,0 +1,51 @@
+# Configuration RepaI
+
+# LLM Settings
+llm:
+  provider: "google"  # openai, google, anthropic, local
+  model: "gemini-2.5-flash-preview-04-17"  # gemini-2.5-flash-preview-04-17, gemini-2.0-flash, gemini-1.5-pro
+  temperature: 0.7
+  max_tokens: 2000
+  api_key: "${GOOGLE_API_KEY}"  # From env
+
+# Execution Settings
+execution:
+  max_iterations: 10
+  timeout_per_iteration: 300  # seconds
+  debug_mode: true
+  log_all_api_calls: true
+
+# Agent Settings
+agent:
+  name: "RepaI"
+  version: "1.0"
+  auto_tool_creation: true
+  recursive_calls: true
+
+# API Settings
+apis:
+  google:
+    base_url: "https://generativelanguage.googleapis.com/v1beta"
+    endpoints:
+      - generateContent
+      - models (list available models)
+  # openai:  # Uncomment to switch back to OpenAI
+  #   base_url: "https://api.openai.com/v1"
+  #   endpoints:
+  #     - chat_completion
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  iteration_log: "iteration_log.md"
+  archive_iterations: true
+
+# Safety Settings
+safety:
+  max_recursion_depth: 10
+  prevent_infinite_loops: true
+  allow_system_commands: false  # À affiner selon besoin
+  allowed_file_operations: 
+    - read
+    - write_markdown
+    - write_python_tools

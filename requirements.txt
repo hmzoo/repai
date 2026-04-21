@@ -1,0 +1,25 @@
+# Requirements pour RepaI
+
+# ============================================================================
+# CORE DEPENDENCIES (Essential)
+# ============================================================================
+pyyaml>=6.0          # YAML config parsing
+requests>=2.28.0     # HTTP requests for APIs
+python-dotenv>=0.20  # Environment variable management (.env support)
+
+# ============================================================================
+# OPTIONAL (for extended functionality)
+# ============================================================================
+langchain>=0.0.300   # LLM framework abstraction (optional)
+
+# ============================================================================
+# DEVELOPMENT (for testing & code quality)
+# ============================================================================
+# pytest>=7.0          # Testing framework (uncomment for testing)
+# black>=22.0          # Code formatting (uncomment for development)
+# pylint>=2.15         # Code linting (uncomment for development)
+
+# ============================================================================
+# DOCUMENTATION (if generating docs)
+# ============================================================================
+# markdown>=3.4        # Markdown processing (uncomment if needed)
