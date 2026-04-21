@@ -78,7 +78,6 @@ L'agent s'exécutera récursivement jusqu'à `max_iterations` (configurable).
 bash reset.sh
 ```
 
-Par défaut, le script restaure le dépôt sur le tag `v1.0-base`, supprime les fichiers non suivis et conserve les fichiers ignorés comme `.env`.
 Par défaut, le script restaure le dépôt sur le tag `v1.0-base-reset`, supprime les fichiers non suivis et conserve les fichiers ignorés comme `.env`.
 
 ### 4. Suivre l'Évolution
