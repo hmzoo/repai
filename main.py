@@ -120,33 +120,61 @@ class EvolutionaryAgent:
 
     @staticmethod
     def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
-        """Extract JSON payload from plain text or fenced markdown block."""
+        """Extract JSON payload from plain text or fenced markdown block.
+        
+        Uses brace-counting to correctly find the end of the root JSON object,
+        even when code_files content contains nested braces.
+        """
         if not text:
             return None
 
-        candidate = text.strip()
-        if candidate.startswith("```"):
-            start = candidate.find("{")
-            end = candidate.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                candidate = candidate[start:end + 1]
-
+        # Direct parse attempt first
         try:
-            parsed = json.loads(candidate)
+            parsed = json.loads(text.strip())
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
             pass
 
+        # Find start of JSON object
         start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                parsed = json.loads(text[start:end + 1])
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                return None
+        if start == -1:
+            return None
+
+        # Walk forward counting braces to find the matching closing brace
+        depth = 0
+        in_string = False
+        escape_next = False
+        end = -1
+        for i, ch in enumerate(text[start:], start=start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+
+        if end == -1:
+            return None
+
+        try:
+            parsed = json.loads(text[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return None
 
         return None
 
@@ -205,6 +233,32 @@ class EvolutionaryAgent:
             [{"role": "user", "content": prompt}],
             temperature=self.config.get("llm", {}).get("temperature", 0.7),
             max_tokens=min(self.config.get("llm", {}).get("max_tokens", 8000), 8000),
+            thinking_budget=0,
+            response_schema={
+                "type": "object",
+                "required": ["next_tasks", "system_prompt_update", "notes"],
+                "properties": {
+                    "next_tasks": {
+                        "type": "array",
+                        "minItems": 5,
+                        "maxItems": 12,
+                        "items": {"type": "string"},
+                    },
+                    "system_prompt_update": {"type": "string"},
+                    "code_files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["path", "content"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                        },
+                    },
+                    "notes": {"type": "string"},
+                },
+            },
         )
 
         if not raw_result.get("success"):

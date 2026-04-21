@@ -200,6 +200,8 @@ class GoogleGeminiClient(APIClient):
             contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
         thinking_budget = kwargs.pop("thinking_budget", 0)
+        response_schema = kwargs.pop("response_schema", None)
+        response_mime_type = kwargs.pop("response_mime_type", "application/json" if response_schema else None)
         data = {
             "contents": contents,
             "generationConfig": {
@@ -210,6 +212,11 @@ class GoogleGeminiClient(APIClient):
                 },
             }
         }
+
+        if response_mime_type:
+            data["generationConfig"]["responseMimeType"] = response_mime_type
+        if response_schema:
+            data["generationConfig"]["responseSchema"] = response_schema
 
         endpoint = f"models/{self.model}:generateContent"
         raw = self.call(endpoint, method="POST", data=data,
